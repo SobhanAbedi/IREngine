@@ -1,6 +1,7 @@
 .venv
 .idea
 IR_data_news_12k*.json
+IR_data_news_5k*.json
 data_500*.json
 data_100*.json
 data_50_*.json

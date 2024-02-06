@@ -88,29 +88,39 @@ def normalize(cnt: str) -> str:
     return cnt
 
 
-def tokenize(cnt: str) -> List[str]:
+def tokenize(cnt: str, to_print: bool = False) -> List[str]:
     words: List[str] = []
-    for word in cnt.split(' '):
+    init_words = cnt.split(' ')
+    if to_print:
+        print("Initial Tokenized words:\n", init_words)
+    for word in init_words:
         word_stem = PPO.stemmer.stem(word)
         if len(word_stem) > 0:
             words.append(word_stem)
+    if to_print:
+        print("Stemmed words: (also removed empty words)\n", words)
     return words
 
 
-def get_clean_words(content: str, common_words_filename: str) -> List[str]:
+def get_clean_words(content: str, common_words_filename: str, print_process: bool = False) -> List[str]:
+    if print_process:
+        print("Showing Preprocessing step-by-step results")
+        print("Initial Content:\n", content)
     # Normalize content
     cnt = normalize(content)
+    if print_process:
+        print("Normalized Content:\n", cnt)
     # Tokenize, Stem and remove empty
-    words = tokenize(cnt)
+    words = tokenize(cnt, print_process)
 
     if path.exists(common_words_filename):
-        most_common_words: List[str]
+        most_common: Dict[str, int]
         with open(common_words_filename, 'r') as f:
-            most_common_words = ujson.load(f)
-            print(f'Initial words: {words}')
-            print(f'Most common words: {most_common_words}')
+            most_common = ujson.load(f)
+            most_common_words = list(most_common.keys())
             words = remove_sorted_list(words, most_common_words)
-            print(f'Resulted words: {words}')
+        if print_process:
+            print("After Removing Most Common Words:\n", words)
     return words
 
 
@@ -132,15 +142,17 @@ def add_doc_words_to_pii(pii: Dict[str, WordEntry], words: List[str], doc_idx: i
             pii[word] = WordEntry(1, 1, {doc_idx: PositionalPosting(1, 0.0, [word_idx])})
 
 
-def save_and_remove_common_words(pii: Dict[str, WordEntry], count: int, common_words_filename: str) -> None:
+def save_and_remove_common_words(pii: Dict[str, WordEntry], count: int, common_words_filename: str,
+                                 print_common_words: bool = False) -> None:
     # Find Common Words
     pii_list = list(pii.items())
     most_common = heapq.nsmallest(count,
                                   heapq.nlargest(count, pii_list, key=lambda x: x[1].collection_count),
                                   key=lambda x: x[0])
-    most_common_words = [''] * count
-    for i in range(len(most_common)):
-        most_common_words[i] = most_common[i][0]
+    most_common_words: Dict[str, int] = {k: v.collection_count for (k, v) in most_common}
+    if print_common_words:
+        for k, v in most_common_words.items():
+            print(f'{k}: {v}')
     # Save them
     with open(common_words_filename, "w") as f:
         ujson.dump(most_common_words, f)
@@ -161,20 +173,23 @@ def gen_tfs(pii: Dict[str, WordEntry]) -> None:
             posting.tf = 1 + log10(posting.count)
 
 
-def gen_stats(pii: Dict[str, WordEntry], doc_count: int, stats_filename: str) -> List[float]:
-    doc_norm_facts: List[float] = [0] * doc_count
+def gen_stats(pii: Dict[str, WordEntry], doc_count: int, stats_filename: str) -> Dict[int, float]:
+    doc_norm_facts: Dict[int, float] = {}
     for _, we in pii.items():
         for doc_idx, posting in we.postings.items():
-            doc_norm_facts[doc_idx] += posting.tf * posting.tf
-    for i in range(doc_count):
-        doc_norm_facts[i] = sqrt(doc_norm_facts[i])
+            if doc_idx in doc_norm_facts:
+                doc_norm_facts[doc_idx] += posting.tf * posting.tf
+            else:
+                doc_norm_facts[doc_idx] = posting.tf * posting.tf
+    for doc_idx in doc_norm_facts.keys():
+        doc_norm_facts[doc_idx] = sqrt(doc_norm_facts[doc_idx])
     stats = {"N": doc_count, "dSize": doc_norm_facts}
     with open(stats_filename, 'w') as f:
         ujson.dump(stats, f)
     return doc_norm_facts
 
 
-def normalize_tfs(pii: Dict[str, WordEntry], norm_facts: List[float]) -> None:
+def normalize_tfs(pii: Dict[str, WordEntry], norm_facts: Dict[int, float]) -> None:
     for word, we in pii.items():
         for doc_idx, posting in we.postings.items():
             posting.tf /= norm_facts[doc_idx]
@@ -227,22 +242,23 @@ def generate_index(filename: str,
                    dict_filename: str,
                    common_words_filename: str,
                    pii_filename: str,
-                   stats_filename: str) -> (int, Dict[str, WordEntry]):
+                   stats_filename: str,
+                   print_process: bool = False) -> (int, Dict[str, WordEntry]):
     doc_count = 0
     pii: Dict[str, WordEntry] = {}
     pii_champs: Dict[str, WordEntry]
-    stats: List[float]
+    stats: Dict[int, float]
     with open(filename, 'r') as f:
         data = ujson.load(f)
         for key, value in data.items():
             # Preprocessing:
-            words = get_clean_words(value['content'], common_words_filename)
+            words = get_clean_words(value['content'], common_words_filename, print_process)
             # Add to Positional Inverted Index:
             add_doc_words_to_pii(pii, words, int(key))
             doc_count += 1
         # If Common Words file doesn't exist it also means that they haven't been removed during preprocessing
         if not path.exists(common_words_filename):
-            save_and_remove_common_words(pii, COMMON_WORD_COUNT, common_words_filename)
+            save_and_remove_common_words(pii, COMMON_WORD_COUNT, common_words_filename, print_process)
         # Save the Positional Inverted Index
         if not path.exists(dict_filename):
             save_dict(pii, dict_filename)
@@ -282,13 +298,18 @@ def search_query(q_words: list[str], pii: Dict[str, WordEntry], pii_champs: Dict
         return
     elif len(q_words) == 1:
         # One Valid word in query
+        if q_words[0] not in pii:
+            print("Word not in dict!")
+            return
         postings_list = list(pii_champs[q_words[0]].postings.items())
         sorted_query_words = heapq.nlargest(K, postings_list, key=lambda x: x[1].tf)
         print("Results:")
         with open(filename, "r") as f:
             data = ujson.load(f)
             for posting in sorted_query_words:
-                print(data[str(posting[0])]['title'])
+                article = data[str(posting[0])]
+                print(article['title'])
+                print(article['url'])
     else:
         # Multiple valid words in query
         # Set elimination threshold based on words in query
@@ -311,7 +332,7 @@ def search_query(q_words: list[str], pii: Dict[str, WordEntry], pii_champs: Dict
                 q_dict[word].qf += 1.0
             else:
                 entry = pii[word]
-                q_dict[word] = QWord(word, log10(doc_count / entry.document_count), 1.0, entry, pii_champs[word])
+                q_dict[word] = QWord(word, log10(doc_count / entry.document_count), 1.0, pii_champs[word], entry)
 
         # Normalize query frequency and idf
         qf_norm_fact = 0
@@ -341,7 +362,9 @@ def search_query(q_words: list[str], pii: Dict[str, WordEntry], pii_champs: Dict
             data = ujson.load(f)
             for idx in range(len(sorted_results)):
                 # print(f'{sorted_results[idx][0]} --> {sorted_results[idx][1]}')
-                print(data[str(sorted_results[idx][0])]['title'])
+                article = data[str(sorted_results[idx][0])]
+                print(article['title'])
+                print(article['url'])
 
 
 def main(filename: str, queries: List[str]):
@@ -362,7 +385,7 @@ def main(filename: str, queries: List[str]):
         # Generate and save PII list and stats
         print("Generating PII and Stats")
         doc_count, pii = generate_index(filename, dict_filename, common_words_filename,
-                                                    pii_filename, stats_filename)
+                                                    pii_filename, stats_filename, False)
     else:
         print("Loading PII and Stats")
         doc_count, stats = load_stats(stats_filename)
@@ -382,7 +405,7 @@ def main(filename: str, queries: List[str]):
     t0 = time.perf_counter()
     for q in queries:
         print(f'Answers for query {q}:')
-        q_words = get_clean_words(q, common_words_filename)
+        q_words = get_clean_words(q, common_words_filename, False)
         search_query(q_words, pii, pii_champs, doc_count, filename)
     t1 = time.perf_counter()
     delta = t1 - t0
@@ -393,9 +416,11 @@ if __name__ == '__main__':
     PPO = PreprocessorObjs()
     COMMON_WORD_COUNT = 50
     K = 5
-    CHAMP_LIST_SIZE = 50
+    CHAMP_LIST_SIZE = 20
     t0 = time.perf_counter()
-    main("IR_data_news_12k.json", ["جلسه علنی اعضای نمایندگان شورای انقلاب اسلامی"])
+    # "جلسه علنی اعضای نمایندگان شورای انقلاب اسلامی"
+    # "کریسمس", "کمیسیون", "آمریکا"
+    main("IR_data_news_12k.json", ["کریسمس", "کمیسیون فدراسیون المپیک معلولین"])
     t1 = time.perf_counter()
     delta = t1 - t0
     print(f"Your code took {delta} seconds to run")
